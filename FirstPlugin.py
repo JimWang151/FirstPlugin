@@ -423,20 +423,50 @@ class XMLBatchSceneReader:
             print(f"❌ 读取XML场景失败: {str(e)}")
 
         return (prompt_collections,)
-
-
-import random
+import collections
 import json
+import os
+import platform
+import random
+import time
+import urllib.parse
+import urllib.request
+import uuid
+import xml.etree.ElementTree as ET
+from typing import List, Dict
+import shutil
 import requests
 import re
 from collections import deque
 
-
-class NewsAPI_Fetcher():
+class NewsAPI_Fetcher:
     CATEGORIES = ["business", "entertainment", "general", "health", "science", "sports", "technology", "random"]
     LANGUAGES = ["ar", "de", "en", "es", "fr", "he", "it", "nl", "no", "pt", "ru", "se", "ud", "zh"]
     SOURCES = ["abc-news", "bbc-news", "cnn", "fox-news", "google-news", "reuters", "the-verge", "time", "wired"]
     API_KEY = "fbf21a3762324da7b2fd6a2c82d51189"
+    NEWS_KEYWORDS = [
+        "politics", "economy", "technology", "health", "environment", "sports", "entertainment", "science", "business", "education",
+        "crime", "weather", "international", "election", "government", "policy", "finance", "market", "stock", "investment",
+        "innovation", "startup", "artificial intelligence", "climate change", "global warming", "sustainability", "energy", "renewable", "pandemic", "vaccine",
+        "healthcare", "medicine", "disease", "public health", "education reform", "school", "university", "research", "security", "cybersecurity",
+        "data breach", "privacy", "immigration", "refugee", "human rights", "protest", "demonstration", "social justice", "equality", "racism",
+        "discrimination", "employment", "jobs", "unemployment", "labor", "wages", "trade", "globalization", "diplomacy", "summit",
+        "treaty", "space exploration", "NASA", "astronomy", "celebrity", "film", "music", "television", "award", "festival",
+        "culture", "fashion", "art", "literature", "football", "basketball", "olympics", "athletics", "tournament", "disaster",
+        "earthquake", "hurricane", "flood", "wildfire", "transportation", "aviation", "infrastructure", "urban development", "housing", "inflation",
+        "recession", "cryptocurrency", "bitcoin", "ethereum", "blockchain", "digital asset", "NFT", "DeFi", "stablecoin", "crypto exchange",
+        "tokenization", "digital wallet", "smart contract", "decentralized finance", "crypto regulation", "bitcoin mining", "altcoin", "digital currency", "fintech", "tourism"
+    ]
+    # 类别与相关关键字的映射
+    CATEGORY_KEYWORD_MAP = {
+        "business": ["economy", "finance", "market", "stock", "investment", "startup", "cryptocurrency", "bitcoin", "ethereum", "blockchain", "digital asset", "NFT", "DeFi", "stablecoin", "crypto exchange", "tokenization", "digital wallet", "smart contract", "decentralized finance", "crypto regulation", "bitcoin mining", "altcoin", "digital currency", "fintech"],
+        "entertainment": ["celebrity", "film", "music", "television", "award", "festival", "culture", "fashion", "art", "literature"],
+        "general": ["politics", "international", "election", "government", "policy", "crime", "weather", "disaster", "earthquake", "hurricane", "flood", "wildfire"],
+        "health": ["health", "pandemic", "vaccine", "healthcare", "medicine", "disease", "public health"],
+        "science": ["science", "research", "space exploration", "NASA", "astronomy", "innovation", "artificial intelligence"],
+        "sports": ["sports", "football", "basketball", "olympics", "athletics", "tournament"],
+        "technology": ["technology", "innovation", "startup", "artificial intelligence", "cybersecurity", "data breach", "privacy", "blockchain", "cryptocurrency", "bitcoin", "ethereum", "digital asset", "NFT", "DeFi", "fintech"]
+    }
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -453,8 +483,8 @@ class NewsAPI_Fetcher():
             }
         }
 
-    RETURN_TYPES = ("JSON",)
-    RETURN_NAMES = ("news_json",)
+    RETURN_TYPES = ("JSON", "STRING")
+    RETURN_NAMES = ("news_json", "json2str")
     FUNCTION = "fetch_news"
     CATEGORY = "News"
 
@@ -470,9 +500,19 @@ class NewsAPI_Fetcher():
         if nums_per_batch < news_nums:
             nums_per_batch = news_nums
 
-        # Handle random category
-        if category == "random":
-            category = random.choice([c for c in self.CATEGORIES if c != "random"])
+        # Handle keyword and category
+        if keyword.strip().upper() != "RANDOM":
+            # Prioritize keyword if not "RANDOM"
+            news_type = "everything"  # Force everything mode for specific keywords
+        else:
+            # Handle random category and keyword
+            if category == "random":
+                category = random.choice([c for c in self.CATEGORIES if c != "random"])
+            # Select keyword related to category
+            keyword = random.choice(self.CATEGORY_KEYWORD_MAP.get(category, self.NEWS_KEYWORDS))
+
+        # Ensure minimum 3 articles
+        news_nums = max(news_nums, 3)
 
         # Collect articles
         collected_articles = []
@@ -534,12 +574,28 @@ class NewsAPI_Fetcher():
                 news_nums,
                 news_type,
                 language,
-                max_content_length
+                max_content_length,
+                category,
+                keyword
             )
 
-        # Convert to JSON
+        # Ensure at least 3 articles by relaxing constraints if needed
+        while len(collected_articles) < 3:
+            self.supplement_articles(
+                collected_articles,
+                3,
+                "everything",  # Fall back to everything
+                language,
+                max_content_length,
+                None,
+                ""  # Use broad search
+            )
+
+        # Convert to JSON and string
         news_json = json.dumps(collected_articles[:news_nums], ensure_ascii=False, indent=2)
-        return (news_json,)
+        json_str = news_json
+
+        return (news_json, json_str)
 
     def get_next_sources(self, count):
         """Get next set of news sources"""
@@ -557,7 +613,7 @@ class NewsAPI_Fetcher():
 
         return ",".join(selected)
 
-    def supplement_articles(self, collected_articles, target_count, news_type, language, max_content_length):
+    def supplement_articles(self, collected_articles, target_count, news_type, language, max_content_length, category=None, keyword=""):
         """Supplement missing articles"""
         missing = target_count - len(collected_articles)
         if missing <= 0:
@@ -572,13 +628,13 @@ class NewsAPI_Fetcher():
                 language,
                 missing * 2,
                 backup_sources,
-                None,
+                category,
                 1,
                 max_content_length
             )
         else:
             backup_articles = self.get_everything(
-                "",
+                keyword,
                 language,
                 missing * 2,
                 backup_sources,
@@ -589,8 +645,8 @@ class NewsAPI_Fetcher():
         # Add non-duplicate articles
         if backup_articles:
             new_articles = [a for a in backup_articles
-                            if a["url"] not in self.article_cache
-                            and a not in collected_articles]
+                           if a["url"] not in self.article_cache
+                           and a not in collected_articles]
             collected_articles.extend(new_articles[:missing])
 
     def get_top_headlines(self, language, page_size, sources, category, page, max_content_length):
@@ -675,7 +731,7 @@ class NewsAPI_Fetcher():
                 "author": article.get("author", "Unknown author"),
                 "title": article.get("title", "No title"),
                 "description": article.get("description", "No description"),
-                "content": content,  # Use processed content
+                "content": content,
                 "url": article.get("url", ""),
                 "urlToImage": article.get("urlToImage", ""),
                 "publishedAt": article.get("publishedAt", "")
@@ -692,7 +748,6 @@ class NewsAPI_Fetcher():
 
         # Trim to max length and add ellipsis if needed
         if max_length > 0 and len(content) > max_length:
-            # Find the last space before max_length to avoid cutting words
             last_space = content.rfind(' ', 0, max_length)
             if last_space != -1 and last_space > max_length * 0.9:
                 return content[:last_space].strip() + "..."
@@ -791,6 +846,153 @@ class Parse_News_Content():
             "Unknown author", "Unknown time", "", "", current_date
         )
 
+
+import xml.etree.ElementTree as ET
+
+
+
+class Parse_XML_News:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "xml_string": ("STRING", {"multiline": True, "default": ""}),
+            }
+        }
+
+    RETURN_TYPES = (
+        "INT",
+        "STRING", "STRING",
+        "STRING", "STRING",
+        "STRING", "STRING",
+        "STRING"
+    )
+    RETURN_NAMES = (
+        "character_gender",
+        "news1_title", "news1_content",
+        "news2_title", "news2_content",
+        "news3_title", "news3_content",
+        "cover_page_prompt"
+    )
+    FUNCTION = "parse_xml"
+    CATEGORY = "custom/news_processing"
+
+    def parse_xml(self, xml_string):
+        try:
+            print(f"received xml data:{xml_string}")
+            root = ET.fromstring(xml_string)
+
+            # 提取基础数据
+            gender = int(root.findtext('character_gender', '0'))
+            cover_prompt = root.findtext('cover_page_prompt', '')
+
+            # 提取新闻1
+            news1 = root.find('news1')
+            news1_title = news1.findtext('title', '') if news1 is not None else ''
+            news1_content = news1.findtext('content', '') if news1 is not None else ''
+
+            # 提取新闻2
+            news2 = root.find('news2')
+            news2_title = news2.findtext('title', '') if news2 is not None else ''
+            news2_content = news2.findtext('content', '') if news2 is not None else ''
+
+            # 提取新闻3
+            news3 = root.find('news3')
+            news3_title = news3.findtext('title', '') if news3 is not None else ''
+            news3_content = news3.findtext('content', '') if news3 is not None else ''
+
+            return (
+                gender,
+                news1_title, news1_content,
+                news2_title, news2_content,
+                news3_title, news3_content,
+                cover_prompt
+            )
+
+        except ET.ParseError as e:
+            # 返回空值作为错误处理
+            print(f"XML解析错误: {str(e)}")
+            return (0, "", "", "", "", "", "", "")
+
+
+import datetime
+
+
+class String_Slicer:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "input_string": ("STRING", {"multiline": True, "default": ""}),
+                "mode": (["left", "right", "middle", "range"], {"default": "left"}),
+                "param1": ("INT", {"default": 0, "min": 0, "step": 1}),
+                "param2": ("INT", {"default": 0, "min": 0, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("sliced_string", "current_date")
+    FUNCTION = "slice_string"
+    CATEGORY = "text/processing"
+
+    def get_current_date(self):
+        """获取当前日期和星期几的英文格式"""
+        now = datetime.datetime.now()
+
+        # 格式化日期为: Today: MM/DD/YYYY
+        date_str = now.strftime("Today: %m/%d/%Y")
+
+        # 获取星期几的英文全称
+        weekday = now.strftime("%A")
+
+        # 组合成完整格式
+        return f"{date_str} {weekday}"
+
+    def slice_string(self, input_string, mode, param1, param2):
+        if not input_string:
+            sliced = ""
+        else:
+            length = len(input_string)
+
+            try:
+                if mode == "left":
+                    # 从左边开始取param1位
+                    end = min(param1, length)
+                    sliced = input_string[:end]
+
+                elif mode == "right":
+                    # 从右边开始取param1位
+                    start = max(0, length - param1)
+                    sliced = input_string[start:]
+
+                elif mode == "middle":
+                    # 从param1位置开始取param2位
+                    start = min(max(0, param1), length)
+                    end = min(start + param2, length)
+                    sliced = input_string[start:end]
+
+                elif mode == "range":
+                    # 从param1位置开始到param2位置结束
+                    start = min(max(0, param1), length)
+                    end = min(max(start, param2), length)
+                    sliced = input_string[start:end]
+                else:
+                    sliced = input_string
+
+            except Exception as e:
+                print(f"字符串切片错误: {str(e)}")
+                sliced = input_string
+
+        # 获取当前日期信息
+        date_info = self.get_current_date()
+
+        return (sliced, date_info)
 
 
 
